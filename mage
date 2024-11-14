@@ -1,0 +1,155 @@
+##Data Extract
+import io
+import pandas as pd
+import requests
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+@data_loader
+def load_data_from_api(*args, **kwargs):
+    """
+    Template for loading data from API
+    """
+    url = 'https://storage.googleapis.com/pay_per_click_sru/Electronic_sales_Sep2023-Sep2024.csv'
+    response = requests.get(url)
+
+    return pd.read_csv(io.StringIO(response.text), sep=',')
+
+
+@test
+def test_output(output, *args) -> None:
+    """
+    Template code for testing the output of the block.
+    """
+    assert output is not None, 'The output is undefined'
+
+
+##Data Transform
+import pandas as pd
+if 'transformer' not in globals():
+    from mage_ai.data_preparation.decorators import transformer
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+@transformer
+def transform(df, *args, **kwargs):
+    """
+    Template code for a transformer block.
+
+    Add more parameters to this function if this block has multiple parent blocks.
+    There should be one parameter for each output variable from each parent block.
+
+    Args:
+        data: The output from the upstream parent block
+        args: The output from any additional upstream blocks (if applicable)
+
+    Returns:
+        Anything (e.g. data frame, dictionary, array, int, str, etc.)
+    """
+    # Specify your transformation logic here
+    df = df.fillna({'Add-ons Purchased': 'Extended Warranty', 'Gender': 'Male'})
+    mode_add_ons = df['Add-ons Purchased'].mode().iloc[0]
+    df['Add-ons Purchased'] = df['Add-ons Purchased'].fillna(mode_add_ons)
+    df = df.drop_duplicates().reset_index(drop=True)
+    df['item_id'] = df.index
+    
+    df['Purchase Date'] = pd.to_datetime(df['Purchase Date'])
+    purchase_date_dim  = df[['Purchase Date']].reset_index(drop=True)
+    purchase_date_dim['date_year'] = purchase_date_dim['Purchase Date'].dt.year
+    purchase_date_dim['date_month'] = purchase_date_dim['Purchase Date'].dt.month
+    purchase_date_dim['date_day'] = purchase_date_dim['Purchase Date'].dt.day
+    purchase_date_dim['date_weekday'] = purchase_date_dim['Purchase Date'].dt.weekday
+    purchase_date_dim['purchase_date_id'] = purchase_date_dim.index
+    purchase_date_dim = purchase_date_dim[['purchase_date_id', 'Purchase Date','date_year', 'date_month', 'date_day', 'date_weekday',]]
+
+    customer_dim =df[['Customer ID', 'Age', 'Gender', 'Loyalty Member']].reset_index(drop=True)
+    customer_dim['customer_id'] = customer_dim.index 
+    customer_dim =customer_dim[['customer_id', 'Customer ID', 'Age', 'Gender', 'Loyalty Member']]
+
+    order_dim = df[['Order Status', 'Payment Method', 'Shipping Type']].reset_index(drop=True)
+    order_dim['order_id'] = order_dim.index
+    order_dim = order_dim[['order_id', 'Order Status', 'Payment Method', 'Shipping Type']] 
+    
+    fact_table = df.merge(purchase_date_dim, left_on='item_id', right_on='purchase_date_id') \
+                .merge(customer_dim, left_on='item_id', right_on='customer_id') \
+                .merge(order_dim, left_on='item_id', right_on='order_id') \
+                [['item_id','purchase_date_id','customer_id','order_id','SKU','Product Type','Unit Price',
+                'Rating','Total Price','Quantity','Add-ons Purchased','Add-on Total']]
+    
+    return {
+            "purchase_date_dim": purchase_date_dim.to_dict(orient="records"),  
+            "customer_dim": customer_dim.to_dict(orient="records"),
+            "order_dim": order_dim.to_dict(orient="records"),
+            "fact_table": fact_table.to_dict(orient="records")
+        } 
+
+
+@test
+def test_output(output, *args) -> None:
+    """
+    Tests the transformer output.
+    """
+    assert output is not None, 'The output is undefined'
+    assert all(key in output for key in ['purchase_date_dim', 'customer_dim', 'order_dim', 'fact_table']), \
+        'Missing one or more required tables'
+    assert all(len(output[key]) > 0 for key in output), 'One or more tables are empty'
+
+
+
+
+##Data Load
+from mage_ai.data_preparation.repo_manager import get_repo_path
+from mage_ai.io.bigquery import BigQuery
+from mage_ai.io.config import ConfigFileLoader
+from pandas import DataFrame
+import pandas as pd
+from os import path
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+@data_exporter
+def export_data_to_big_query(data, **kwargs) -> None:
+    """
+    Export data to BigQuery with special handling for customer_dim
+    """
+    config_path = path.join(get_repo_path(), 'io_config.yaml')
+    config_profile = 'default'
+    
+    # Initialize BigQuery client
+    bq_client = BigQuery.with_config(ConfigFileLoader(config_path, config_profile))
+    
+    for table_name, records in data.items():
+        try:
+            df = DataFrame(records)
+            table_id = f'psyched-scene-436623-m0.sales_project.{table_name}'
+            
+            # Special handling for customer_dim
+            if table_name == 'customer_dim':
+                # Rename columns to match existing schema
+                df = df.rename(columns={
+                    'customer_id': 'Customer_ID',  
+                    'Customer ID': 'Original_Customer_ID', 
+                    'Age': 'Age',
+                    'Gender': 'Gender',
+                    'Loyalty Member': 'Loyalty_Member'
+                })
+                print(f"Customer dimension columns after rename: {list(df.columns)}")
+            
+            # Export to BigQuery
+            bq_client.export(
+                df,
+                table_id,
+                if_exists='replace'
+            )
+            print(f"Successfully exported {table_name} to BigQuery")
+            
+        except Exception as e:
+            print(f"Error exporting {table_name}")
+            print(f"Columns in DataFrame: {list(df.columns)}")
+            print(f"Error details: {str(e)}")
+            raise
